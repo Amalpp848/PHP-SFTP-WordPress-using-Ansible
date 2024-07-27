@@ -1,0 +1,367 @@
+---
+- name: Install packages, configure MariaDB, and set up WordPress
+  hosts: all
+  become: yes
+  vars:
+    wordpress_dir: "/home/amal/websitename/public"
+    phpmyadmin_dir: "/home/amal/websitename/public/phpmyadmin"
+
+  tasks:
+
+    - name: Check if swapfile exists
+      stat:
+        path: /swapfile
+      register: swapfile_check
+
+    - name: Create swapfile if not already created
+      command: "fallocate -l 2G /swapfile"
+      when: not swapfile_check.stat.exists
+
+    - name: Change permissions for swapfile
+      command: "chmod 600 /swapfile"
+      when: not swapfile_check.stat.exists
+
+    - name: Set up swapspace on swapfile
+      command: "mkswap /swapfile"
+      when: not swapfile_check.stat.exists
+
+    - name: Enable swapfile
+      command: "swapon /swapfile"
+      when: not swapfile_check.stat.exists
+
+    - name: Ensure swapfile entry in fstab
+      lineinfile:
+        path: /etc/fstab
+        line: "/swapfile swap swap defaults 0 0"
+        create: yes
+        state: present
+
+    - name: Install Python pip
+      yum:
+        name: python3-pip
+        state: present
+
+    - name: Install pexpect via pip
+      pip:
+        name: pexpect
+        state: present
+
+    - name: Install Nginx
+      yum:
+        name: nginx
+        state: latest
+
+    - name: Start and enable Nginx
+      service:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Download EPEL release RPM
+      get_url:
+        url: https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm
+        dest: /tmp/epel-release-latest-8.noarch.rpm
+  - name: Import the EPEL GPG key
+      rpm_key:
+        state: present
+        key: https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-8
+
+    - name: Install EPEL release RPM
+      yum:
+        name: /tmp/epel-release-latest-8.noarch.rpm
+        state: present
+
+    - name: Install PHP and necessary modules
+      yum:
+        name:
+          - php
+          - php-mysqlnd
+          - php-json
+          - php-mbstring
+          - php-gd
+          - php-xml
+          - php-curl
+        state: latest
+
+    - name: Install PHP-FPM
+      yum:
+        name: php-fpm
+        state: latest
+
+    - name: Start and enable PHP-FPM
+      service:
+        name: php-fpm
+        state: started
+        enabled: yes
+    - name: Install MariaDB server
+      yum:
+        name: mariadb-server
+        state: latest
+
+    - name: Start and enable MariaDB
+      service:
+        name: mariadb
+        state: started
+        enabled: yes
+
+    - name: Copy secure_mysql.sh script to the server
+      copy:
+        src: /root/ansible/project/secure_mysql.sh
+        dest: /tmp/secure_mysql.sh
+        mode: '0755'
+
+    - name: Run secure_mysql.sh script
+      shell: /tmp/secure_mysql.sh
+      become: yes
+
+    - name: Create MySQL database amal
+      command: mysql -u root -predhat -e "CREATE DATABASE IF NOT EXISTS amaldata;"
+
+    - name: Create MySQL user amal with password 123
+      command: >
+        mysql -u root -predhat -e "
+        CREATE USER IF NOT EXISTS 'amal'@'localhost' IDENTIFIED BY '123';
+        GRANT ALL PRIVILEGES ON *.* TO 'amal'@'localhost';
+        FLUSH PRIVILEGES;"
+    - name: Create user amal with password 123
+      user:
+        name: amal
+        password: "{{ '123' | password_hash('sha512') }}"
+        state: present
+
+    - name: Set ownership and permissions for /home/amal
+      file:
+        path: /home/amal
+        owner: amal
+        group: amal
+        mode: '0755'
+
+    - name: Create uploads directory for amal
+      file:
+        path: /home/amal/uploads
+        state: directory
+        owner: amal
+        mode: '0755'
+
+    - name: Create public directory for amal
+      file:
+        path: /home/amal/websitename/public
+        state: directory
+        owner: amal
+        group: amal
+        mode: '0755'
+    - name: Configure SSH for SFTP access
+      blockinfile:
+        path: /etc/ssh/sshd_config
+        block: |
+          Match User amal
+              ChrootDirectory /home/amal
+              ForceCommand internal-sftp
+              AllowTcpForwarding no
+              PasswordAuthentication yes
+
+    - name: Restart SSH service
+      service:
+        name: sshd
+        state: restarted
+
+    # WordPress setup tasks
+    - name: Create WordPress directory
+      file:
+        path: "{{ wordpress_dir }}"
+        state: directory
+        owner: nginx
+        group: nginx
+        mode: '0755'
+
+    - name: Download WordPress
+      get_url:
+        url: https://wordpress.org/latest.tar.gz
+        dest: /tmp/wordpress.tar.gz
+
+
+    - name: Extract WordPress
+      unarchive:
+        src: /tmp/wordpress.tar.gz
+        dest: "{{ wordpress_dir }}"
+        remote_src: yes
+        extra_opts: [--strip-components=1]
+
+    - name: Set permissions for WordPress files
+      file:
+        path: "{{ wordpress_dir }}"
+        owner: nginx
+        group: nginx
+        mode: '0755'
+        recurse: yes
+
+    - name: Configure Nginx for WordPress
+      copy:
+        dest: /etc/nginx/conf.d/wordpress.conf
+        content: |
+          server {
+              listen 80;
+              server_name amal123.online;
+              root /home/amal/websitename/public;
+
+              index index.php index.html index.htm;
+
+              location / {
+                  try_files $uri $uri/ /index.php?$args;
+              }
+
+              location ~ \.php$ {
+                  include fastcgi_params;
+                  fastcgi_pass unix:/run/php-fpm/www.sock;  # Update this line if necessary
+                  fastcgi_index index.php;
+                  fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+              }
+
+              location ~ /\.ht {
+                  deny all;
+              }
+          }
+      notify: Restart Nginx
+
+    - name: Set permissions for /home/amal/websitename/public
+      command: chmod -R 755 /home/amal/websitename/public
+
+    - name: Set permissions for /home/amal/websitename
+      command: chmod -R 755 /home/amal/websitename
+
+    - name: Set permissions for /home/amal
+      command: chmod -R 755 /home/amal
+
+    - name: Set permissions for /home
+      command: chmod -R 755 /home
+
+    - name: Disable SELinux enforcement
+      command: setenforce 0
+    - name: Copy wp-config-sample.php to wp-config.php
+      copy:
+        src: /home/amal/websitename/public/wp-config-sample.php
+        dest: /home/amal/websitename/public/wp-config.php
+        remote_src: yes
+    - name: Update DB_NAME in wp-config.php
+      lineinfile:
+        path: /home/amal/websitename/public/wp-config.php
+        regexp: "define\\( *'DB_NAME', *'.*' *\\);"
+        line: "define('DB_NAME', 'amaldata');"
+
+
+    - name: Update DB_USER in wp-config.php
+      lineinfile:
+        path: /home/amal/websitename/public/wp-config.php
+        regexp: "define\\( *'DB_USER', *'.*' *\\);"
+        line: "define('DB_USER', 'amal');"
+
+    - name: Update DB_PASSWORD in wp-config.php
+      lineinfile:
+        path: /home/amal/websitename/public/wp-config.php
+        regexp: "define\\( *'DB_PASSWORD', *'.*' *\\);"
+        line: "define('DB_PASSWORD', '123');"
+
+    - name: Update DB_HOST in wp-config.php
+      lineinfile:
+        path: /home/amal/websitename/public/wp-config.php
+        regexp: "define\\( *'DB_HOST', *'.*' *\\);"
+        line: "define('DB_HOST', 'localhost');"
+
+    - name: Ensure correct ownership and permissions on wp-config.php
+      file:
+        path: /home/amal/websitename/public/wp-config.php
+        owner: nginx
+        group: nginx
+        mode: '0644'
+
+    # phpMyAdmin setup tasks
+    - name: Create phpMyAdmin directory
+      file:
+        path: "{{ phpmyadmin_dir }}"
+        state: directory
+        owner: nginx
+        group: nginx
+        mode: '0755'
+
+    - name: Download phpMyAdmin
+      get_url:
+        url: https://www.phpmyadmin.net/downloads/phpMyAdmin-latest-all-languages.tar.gz
+        dest: /tmp/phpMyAdmin-latest-all-languages.tar.gz
+
+    - name: Extract phpMyAdmin
+      unarchive:
+        src: /tmp/phpMyAdmin-latest-all-languages.tar.gz
+        dest: "{{ phpmyadmin_dir }}"
+        remote_src: yes
+        extra_opts: [--strip-components=1]
+
+    - name: Set permissions for phpMyAdmin files
+      file:
+        path: "{{ phpmyadmin_dir }}"
+        owner: nginx
+        group: nginx
+        mode: '0755'
+        recurse: yes
+   # Certbot and SSL configuration
+    - name: Install snapd
+      yum:
+        name: snapd
+        state: present
+
+    - name: Enable and start snapd
+      systemd:
+        name: snapd
+        state: started
+        enabled: yes
+
+    - name: Create symlink for snap
+      file:
+        src: /var/lib/snapd/snap
+        dest: /snap
+        state: link
+
+    - name: Install Certbot
+      command: snap install --classic certbot
+
+    - name: Create Certbot symlink
+      command: ln -s /snap/bin/certbot /usr/bin/certbot
+      args:
+        creates: /usr/bin/certbot
+
+    - name: Ensure Nginx server block for amal123.online
+      blockinfile:
+        path: /etc/nginx/conf.d/wordpress.conf
+        block: |
+          server {
+              listen 80;
+              server_name amal123.online;
+              root /home/amal/websitename/public;
+
+              index index.php index.html index.htm;
+
+              location / {
+                  try_files $uri $uri/ /index.php?$args;
+              }
+
+              location ~ \.php$ {
+                  include fastcgi_params;
+                  fastcgi_pass unix:/run/php-fpm/www.sock;  # Update this line if necessary
+                  fastcgi_index index.php;
+                  fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+             }
+
+              location ~ /\.ht {
+                  deny all;
+              }
+          }
+      notify: Restart Nginx
+
+    - name: Obtain SSL certificate using Certbot
+      command: certbot --nginx -d amal123.online --non-interactive --agree-tos --email amalpp848@gmail.com
+
+  handlers:
+    - name: Restart Nginx
+      service:
+        name: nginx
+        state: restarted
+                                    
